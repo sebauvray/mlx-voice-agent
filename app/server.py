@@ -743,7 +743,7 @@ def _split_multipart(body: bytes, content_type: str) -> tuple[dict, str, bytes]:
 
 def _build_multipart(fields: dict, wav: bytes) -> tuple[bytes, str]:
     """Reconstruire l'envoi autour du son normalisé, champs conservés."""
-    boundary = f"----flowhub{secrets.token_hex(8)}"
+    boundary = f"----voiceagent{secrets.token_hex(8)}"
     out = bytearray()
     for name, value in fields.items():
         # Un champ qui contiendrait un saut de ligne pourrait fabriquer
