@@ -43,14 +43,20 @@ seconde connexion avec un message clair plutôt que de tomber en OOM.
 import argparse
 import asyncio
 import hmac
+import io
 import json
 import logging
+import math
 import os
 import pathlib
 import secrets
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
+import wave
 from typing import Any, Optional
 
 import ipaddress
@@ -206,7 +212,27 @@ def _same_utterance(a: str, b: str) -> bool:
 
 
 CHRONO = Chrono()
-VAD_SILENCE_MS = 600
+# Silence exigé avant que smart-turn soit seulement consulté. Il se paie
+# INTÉGRALEMENT sur l'attente ressentie, à chaque tour.
+# 900 ms, et les deux bornes ont été essayées le 29/08/2026 :
+#   600 (défaut amont) — smart-turn a déclaré finie, avec p=0,99, une
+#       phrase qui continuait : il avait entendu une clause qui sonnait
+#       complète pendant une pause de réflexion. Aucun réglage de seuil ne
+#       rattrape ça — à 0,99 il n'hésitait pas, il se trompait. Le seul
+#       levier est de ne pas le consulter si tôt.
+#   1200 — jugé trop mou à l'usage. Ce délai se paie INTÉGRALEMENT sur
+#       l'attente ressentie, à chaque tour, en plus du traitement.
+# 900 est le compromis retenu : 300 ms de marge sur les pauses, 300 ms
+# d'attente en plus par réponse.
+VAD_SILENCE_MS = 900
+# Durée maximale d'un tour, au-delà de laquelle mlx-audio finalise de
+# force. Son défaut est de 30 s : correct pour une conversation qui
+# s'échange, absurde pour une secrétaire à qui on dicte. Relevé en usage
+# réel, un exposé de trente secondes s'est fait couper sur « je perds »,
+# sans avertissement ni évaluation de fin de tour — puis le reste de la
+# phrase a démarré le tour suivant en plein milieu, que Whisper a rendu
+# en cyrillique.
+MAX_TURN_SECONDS = 180.0
 
 
 class WebVoicePipeline(VoicePipeline):
@@ -254,6 +280,19 @@ class WebVoicePipeline(VoicePipeline):
                   f" seuil {TURN_THRESHOLD:.2f},"
                   f" silence {fields.get('silence_ms', 0):.0f} ms)",
                   file=sys.stderr)
+
+        if event == "max_turn_duration":
+            # Coupure DURE : le tour a atteint vad_max_turn_seconds et se
+            # termine séance tenante, au milieu du mot, sans que smart-turn
+            # ait son mot à dire. En amont l'événement n'existe qu'en mode
+            # verbeux — c'était donc la seule façon de perdre la parole
+            # sans laisser la moindre trace dans le journal. On la dit, et
+            # on la dit aussi à l'écran : sinon l'agent a juste l'air de
+            # couper au hasard.
+            print(f"  ✂ tour coupé : {float(fields.get('duration_seconds', 0)):.0f} s"
+                  f" de parole d'affilée (maximum {MAX_TURN_SECONDS:.0f} s)",
+                  file=sys.stderr)
+            HUB.event("note", text="Tour coupé : durée maximale de parole atteinte.")
 
         if event == "turn_finalization_started":
             CHRONO.reset(); CHRONO.mark("turn_end")
@@ -637,6 +676,315 @@ def build_app(cfg: VoicePipelineConfig, engine, make_lease, token: str) -> FastA
     return app
 
 
+# ── L'API de dictée, normalisée et surveillée ────────────────────────
+# Ce qui suit enveloppe l'application FastAPI de mlx-audio : on ne touche
+# pas à son endpoint, on s'intercale devant pour lui donner un son qu'il
+# sait lire, et pour laisser une trace de ce qui s'est passé.
+
+_DICTATION_PATH = "/v1/audio/transcriptions"
+
+# Whisper travaille en 16 kHz mono : c'est son propre front-end. Lui
+# livrer directement ce format évite un rééchantillonnage et divise la
+# taille du corps par six sans perdre un bit utile.
+STT_RATE = 16000
+
+# Whisper ne rend JAMAIS une transcription vide : sur du silence il rend
+# une phrase de son corpus — « Thank you. », « Merci. », « Sous-titres
+# réalisés par la communauté d'Amara.org ». Le symptôme est toujours le
+# même (une dictée qui répond toujours la même chose) et la cause est
+# toujours en amont, dans le son. On coupe donc sur le NIVEAU, jamais sur
+# le texte : filtrer des phrases censurerait un « merci » réellement dit.
+# Les deux seuils sont exigés ENSEMBLE — une voix lointaine a un niveau
+# moyen très bas mais garde des crêtes nettes.
+STT_SILENCE_DBFS = -50.0
+STT_SILENCE_PEAK_DBFS = -35.0
+
+# On garde une copie des envois muets — et d'eux seuls — pour pouvoir les
+# écouter. Cinq au plus, écrasés en rond : de quoi diagnostiquer sans
+# transformer le disque en archive de tout ce qui est dicté.
+STT_KEEP_SUSPECT = 5
+
+
+def _dbfs(amplitude: float) -> float:
+    return -120.0 if amplitude <= 1e-6 else 20.0 * math.log10(amplitude)
+
+
+def _split_multipart(body: bytes, content_type: str) -> tuple[dict, str, bytes]:
+    """Les champs texte, le nom du fichier, et ses octets.
+
+    Découpage manuel plutôt que python-multipart : on a déjà le corps
+    entier en mémoire, alors que son parseur travaille en flux avec des
+    callbacks. La frontière suffit."""
+    m = re.search(r'boundary="?([^";]+)"?', content_type)
+    if not m:
+        return {}, "", b""
+    delim = b"--" + m.group(1).encode()
+    fields: dict = {}
+    filename, audio = "", b""
+    for chunk in body.split(delim):
+        head, sep, payload = chunk.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        name = re.search(rb'\bname="([^"]*)"', head)
+        if not name:
+            continue
+        # La partie se termine par le CRLF qui précède la frontière
+        # suivante : il n'appartient pas à la valeur.
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        found = re.search(rb'\bfilename="([^"]*)"', head)
+        if found is not None:
+            filename, audio = found.group(1).decode("utf-8", "replace"), payload
+        else:
+            fields[name.group(1).decode("utf-8", "replace")] = payload.decode(
+                "utf-8", "replace")
+    return fields, filename, audio
+
+
+def _build_multipart(fields: dict, wav: bytes) -> tuple[bytes, str]:
+    """Reconstruire l'envoi autour du son normalisé, champs conservés."""
+    boundary = f"----flowhub{secrets.token_hex(8)}"
+    out = bytearray()
+    for name, value in fields.items():
+        # Un champ qui contiendrait un saut de ligne pourrait fabriquer
+        # une partie de son cru. Aucun champ légitime n'en a besoin.
+        if any(c in name + value for c in "\r\n\""):
+            continue
+        out += (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n").encode()
+    out += (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; '
+            f'filename="audio.wav"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n").encode()
+    out += wav + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
+
+
+def _decode_upload(raw: bytes, filename: str) -> np.ndarray:
+    """Décoder l'envoi en 16 kHz mono, DEPUIS UN FICHIER.
+
+    Le « depuis un fichier » est tout l'objet de cette fonction. mlx-audio
+    décode les conteneurs (m4a, ogg, webm) en poussant les octets dans
+    l'entrée standard d'ffmpeg. Ça marche pour Ogg et WebM, qui se lisent
+    d'un bout à l'autre. Ça ne marche PAS pour MP4/M4A : son index (moov)
+    est écrit à la fin du fichier, et une fois lu il faut revenir en
+    arrière jusqu'aux données. Sur un tube on ne revient pas en arrière —
+    ffmpeg abandonne sur « partial file », sort en code 0, et rend zéro
+    échantillon. mlx-audio n'a alors plus que du silence à transcrire, et
+    Whisper, qui ne rend jamais rien de vide, hallucine « Thank you. ».
+
+    C'est exactement le chemin de Safari et d'iOS, dont MediaRecorder
+    n'enregistre qu'en audio/mp4. Un fichier temporaire est seekable : le
+    même ffmpeg décode alors les 5,1 s attendues."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg introuvable")
+    # L'extension n'oriente pas le décodage (ffmpeg reconnaît le
+    # conteneur aux octets), mais elle rend le fichier temporaire lisible
+    # dans un `lsof`. Elle vient du client : on n'en garde que la forme.
+    suffix = pathlib.Path(filename).suffix
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix or ""):
+        suffix = ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+        tmp.write(raw)
+        tmp.flush()
+        done = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", tmp.name, "-f", "s16le",
+             "-acodec", "pcm_s16le", "-ar", str(STT_RATE), "-ac", "1", "pipe:1"],
+            capture_output=True)
+    if done.returncode != 0:
+        raise RuntimeError(done.stderr.decode("utf-8", "replace").strip()[-300:]
+                           or f"ffmpeg a échoué (code {done.returncode})")
+    return np.frombuffer(done.stdout, dtype=np.int16)
+
+
+def _to_wav(pcm16: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(STT_RATE)
+        out.writeframes(pcm16.tobytes())
+    return buf.getvalue()
+
+
+def _levels(pcm16: np.ndarray) -> tuple[float, float]:
+    if pcm16.size == 0:
+        return -120.0, -120.0
+    samples = pcm16.astype(np.float32) / 32768.0
+    return (_dbfs(float(np.sqrt(np.mean(np.square(samples))))),
+            _dbfs(float(np.max(np.abs(samples)))))
+
+
+def _final_text(raw: bytes) -> str:
+    """Le texte de la réponse, quel que soit son format.
+
+    mlx-audio répond par défaut en ndjson : une ligne par événement, la
+    dernière portant la charge complète. On applique sa propre règle —
+    une ligne qui porte `segments` ou `language` remplace, les autres
+    s'accumulent."""
+    body = raw.decode("utf-8", "replace")
+    text, structured = "", False
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("text"), str):
+            continue
+        structured = True
+        if "segments" in obj or "language" in obj:
+            text = obj["text"]
+        else:
+            text += obj["text"]
+    # `response_format=text` répond en texte brut : rien à désérialiser.
+    return (text if structured else body).strip()
+
+
+def _keep_silent_upload(raw: bytes, filename: str) -> Optional[pathlib.Path]:
+    """Déposer l'envoi muet tel quel dans ~/.mlx-audio/debug, en rond.
+
+    Muet, donc sans contenu à protéger — et c'est la seule pièce qui
+    permette de distinguer un micro coupé d'un décodage raté."""
+    try:
+        dest = NOTEBOOK.dir.parent / "debug"
+        dest.mkdir(parents=True, exist_ok=True)
+        kept = sorted(dest.glob("*.*"), key=lambda f: f.stat().st_mtime)
+        for stale in kept[:max(0, len(kept) - STT_KEEP_SUSPECT + 1)]:
+            stale.unlink(missing_ok=True)
+        path = dest / (time.strftime("%Y%m%d-%H%M%S-muet")
+                       + (pathlib.Path(filename).suffix or ".bin"))
+        path.write_bytes(raw)
+        return path
+    except OSError as e:
+        print(f"  ! copie de diagnostic impossible : {e}", file=sys.stderr)
+        return None
+
+
+class DictationProbe:
+    """Ce qui entre, ce qui sort, et ce qu'il y avait vraiment dans le son.
+
+    Écrit après une dictée qui répondait « Thank you. » à tout : rien dans
+    le journal ne permettait de distinguer un micro muet d'un conteneur
+    mal décodé, parce que l'API de mlx-audio ne trace RIEN. Une ligne par
+    dictée — durée, niveau, texte rendu — tranche en une seconde.
+
+    En cas de doute sur son propre travail (corps non multipart, ffmpeg
+    absent, décodage impossible), l'enveloppe se retire et laisse passer
+    la requête d'origine : elle ne doit jamais être ce qui casse la
+    dictée."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope.get("type") != "http" or scope.get("method") != "POST"
+                or scope.get("path") != _DICTATION_PATH):
+            return await self.app(scope, receive, send)
+
+        body = b""
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+
+        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        fields, filename, audio = _split_multipart(
+            body, headers.get("content-type", ""))
+        label = f"{filename or '(sans nom)'} ({len(audio) / 1024:.0f} ko)"
+
+        if not audio:
+            print("  dictée : corps illisible, transmis tel quel", file=sys.stderr)
+            return await self._forward(scope, receive, body, None, send, label)
+
+        try:
+            pcm = _decode_upload(audio, filename)
+        except Exception as e:
+            print(f"  dictée : {label} — NON DÉCODÉ ({e}), transmis tel quel",
+                  file=sys.stderr)
+            return await self._forward(scope, receive, body, None, send, label)
+
+        rms, peak = _levels(pcm)
+        label += (f" → {pcm.size / STT_RATE:.1f} s, "
+                  f"RMS {rms:.0f} dBFS, crête {peak:.0f} dBFS")
+
+        if rms < STT_SILENCE_DBFS and peak < STT_SILENCE_PEAK_DBFS:
+            kept = _keep_silent_upload(audio, filename)
+            print(f"  dictée : {label} — MUET, réponse vide (Whisper y aurait "
+                  f"halluciné une phrase)"
+                  f"{f' [copie : {kept.name}]' if kept else ''}", file=sys.stderr)
+            return await self._empty(scope, fields, send)
+
+        new_body, content_type = _build_multipart(fields, _to_wav(pcm))
+        return await self._forward(scope, receive, new_body, content_type, send, label)
+
+    async def _forward(self, scope, receive, body, content_type, send, label) -> None:
+        drop = {b"content-length"} | ({b"content-type"} if content_type else set())
+        rebuilt = [(k, v) for k, v in scope["headers"] if k.lower() not in drop]
+        rebuilt.append((b"content-length", str(len(body)).encode()))
+        if content_type:
+            rebuilt.append((b"content-type", content_type.encode()))
+        scope = dict(scope, headers=rebuilt)
+
+        replayed = False
+
+        async def _receive():
+            # Une fois le corps rejoué, on rend la main au vrai canal :
+            # StreamingResponse écoute `receive` pour savoir si le client
+            # raccroche. Lui répondre « http.disconnect » d'office lui
+            # fait interrompre le flux avant d'avoir rien envoyé — « ASGI
+            # callable returned without completing response ».
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        answered = bytearray()
+
+        async def _send(message):
+            if message["type"] == "http.response.body":
+                answered.extend(message.get("body", b""))
+            await send(message)
+
+        started = time.monotonic()
+        try:
+            await self.app(scope, _receive, _send)
+        finally:
+            text = _final_text(bytes(answered))
+            shown = text if len(text) <= 90 else text[:87] + "…"
+            print(f"  dictée : {label} — « {shown} » "
+                  f"en {time.monotonic() - started:.2f} s", file=sys.stderr)
+
+    async def _empty(self, scope, fields, send) -> None:
+        """Une transcription vide, dans le format demandé.
+
+        Une ligne de JSON est à la fois du JSON et du ndjson valides :
+        c'est la seule réponse qui satisfasse les deux sans rejouer la
+        négociation de format de mlx-audio."""
+        fmt = fields.get("response_format", "ndjson")
+        if fmt == "text":
+            response = PlainTextResponse("")
+        else:
+            response = Response(
+                json.dumps({"text": "", "segments": [], "language": None}),
+                media_type=("application/json" if fmt in ("json", "verbose_json")
+                            else "application/x-ndjson"))
+
+        async def _receive():
+            return {"type": "http.disconnect"}
+
+        await response(scope, _receive, send)
+
+
 async def _sender(ws: WebSocket) -> None:
     """Un seul writer sur la socket : Starlette n'aime pas les envois
     concurrents, et le TTS comme les événements poussent en parallèle."""
@@ -649,6 +997,10 @@ async def _sender(ws: WebSocket) -> None:
 
 
 def main() -> int:
+    # Déclaré ici et pas plus bas : la valeur sert de défaut à
+    # `--stt-silence-dbfs`, donc elle est LUE avant d'être écrite, et
+    # Python refuse un `global` postérieur au premier usage.
+    global STT_SILENCE_DBFS, MAX_TURN_SECONDS, VAD_SILENCE_MS
     # Les valeurs par défaut viennent de ~/.thebureau/thebureau.conf : la
     # conf de l'infra fait autorité, la ligne de commande ne sert qu'à en
     # dévier ponctuellement.
@@ -715,8 +1067,26 @@ def main() -> int:
                         "amont (1600) coupe une pause de réflexion en pleine "
                         "phrase. Ne coûte RIEN sur un tour normal : ce délai "
                         "ne s'applique que si smart-turn dit « pas fini ».")
+    p.add_argument("--max-turn-seconds", type=float,
+                   default=float(os.environ.get("VOICE_AGENT_MAX_TURN_SECONDS")
+                                 or MAX_TURN_SECONDS),
+                   help="Durée maximale d'un tour avant finalisation forcée. "
+                        "180 s et non les 30 s d'amont : ce défaut convient à "
+                        "un échange, pas à quelqu'un qui dicte. La coupure est "
+                        "sèche — ni avis de smart-turn, ni fin de phrase — et "
+                        "le reste de la parole redémarre le tour suivant en "
+                        "plein milieu.")
+    p.add_argument("--max-turn-tokens", type=int,
+                   default=int(os.environ.get("VOICE_AGENT_MAX_TURN_TOKENS")
+                               or 1024),
+                   help="Longueur maximale, en jetons, de la transcription "
+                        "d'UN tour. Relever la durée sans relever ceci ne "
+                        "déplacerait que le mur : à 256 jetons (défaut amont) "
+                        "la session STT se déclare finie vers une minute de "
+                        "parole, et tout ce qui suit est jeté en silence.")
     p.add_argument("--vad-end-silence-ms", type=int,
-                   default=int(os.environ.get("VOICE_AGENT_VAD_SILENCE_MS") or 600),
+                   default=int(os.environ.get("VOICE_AGENT_VAD_SILENCE_MS")
+                               or VAD_SILENCE_MS),
                    help="Silence avant que smart-turn soit consulté. Se paie "
                         "intégralement sur l'attente ressentie ; le baisser "
                         "rend l'agent plus vif mais plus coupeur de parole.")
@@ -732,6 +1102,15 @@ def main() -> int:
                         "être publiée par l'ingress.")
     p.add_argument("--no-api", action="store_true",
                    help="Ne pas servir l'API mlx-audio (voix seule).")
+    p.add_argument("--stt-silence-dbfs", type=float,
+                   default=float(os.environ.get("VOICE_AGENT_STT_SILENCE_DBFS")
+                                 or STT_SILENCE_DBFS),
+                   help="Niveau moyen sous lequel une dictée est tenue pour "
+                        "muette et renvoie un texte vide, au lieu de la "
+                        "phrase que Whisper hallucine sur du silence. "
+                        "Une crête faible est exigée en plus, pour ne pas "
+                        "rejeter une voix simplement lointaine. -120 pour "
+                        "désactiver le garde-fou.")
     p.add_argument("--token", default=os.environ.get("VOICE_AGENT_TOKEN", ""),
                    help="Jeton d'accès. Généré si absent.")
     p.add_argument("--mlx-cache-gb", type=float,
@@ -813,12 +1192,14 @@ def main() -> int:
     )
     global TTS_LANG
     TTS_LANG = args.tts_lang
-    global VAD_SILENCE_MS, SPECULATE, TURN_THRESHOLD, NOTEBOOK, INGRESS_NETS
+    global SPECULATE, TURN_THRESHOLD, NOTEBOOK, INGRESS_NETS
     global TURN_WATCHDOG
     VAD_SILENCE_MS = args.vad_end_silence_ms
     SPECULATE = args.speculate
     TURN_THRESHOLD = args.turn_threshold
     TURN_WATCHDOG = args.turn_watchdog
+    STT_SILENCE_DBFS = args.stt_silence_dbfs
+    MAX_TURN_SECONDS = args.max_turn_seconds
     if args.notes_dir:
         NOTEBOOK = Notebook(args.notes_dir)
     for cidr in (args.ingress_cidr or "").split(","):
@@ -835,6 +1216,8 @@ def main() -> int:
         tts_voice=args.voice,
         system_prompt=args.system_prompt,
         vad_end_silence_ms=args.vad_end_silence_ms,
+        vad_max_turn_seconds=args.max_turn_seconds,
+        stt_max_turn_tokens=args.max_turn_tokens,
         turn_max_incomplete_silence_ms=args.turn_incomplete_ms,
         turn_threshold=args.turn_threshold,
         verbose=args.verbose,
@@ -855,10 +1238,13 @@ def main() -> int:
           f"  LLM       : {args.llm_model} @ {args.llm_url}"
           f" (raisonnement {'activé' if args.thinking else 'coupé'})\n"
           f"  Carte     : {'réservée par session' if make_lease else 'pas de réservation'}\n"
-          f"  Fin de tour : smart-turn p≥{args.turn_threshold}"
+          f"  Tour max  : {args.max_turn_seconds:.0f} s / {args.max_turn_tokens} jetons\n"
+          f"  Fin de tour : après {args.vad_end_silence_ms} ms de silence, "
+          f"smart-turn p≥{args.turn_threshold}"
           f"{f', sinon {args.turn_incomplete_ms} ms' if args.turn_watchdog else ' (pas de repli sur délai)'}\n"
           f"  API mlx-audio : "
-          f"{'désactivée' if args.no_api else f'127.0.0.1:{args.api_port} (locale)'}\n"
+          f"{'désactivée' if args.no_api else f'127.0.0.1:{args.api_port} (locale)'}"
+          f"{'' if args.no_api else f', dictée muette sous {args.stt_silence_dbfs:.0f} dBFS'}\n"
           f"  Sans jeton depuis : {', '.join(str(n) for n in INGRESS_NETS) or 'nulle part'}\n"
           f"  Notes     : {NOTEBOOK.dir}\n"
           f"  Interface : http://{args.host}:{args.port}/?k={token}\n"
@@ -884,7 +1270,8 @@ async def _serve(voice_app, args) -> None:
     if not args.no_api:
         from mlx_audio.server import app as api_app
         servers.append(uvicorn.Server(uvicorn.Config(
-            api_app, host="127.0.0.1", port=args.api_port, log_level="warning")))
+            DictationProbe(api_app), host="127.0.0.1", port=args.api_port,
+            log_level="warning")))
     await asyncio.gather(*(s.serve() for s in servers))
 
 
