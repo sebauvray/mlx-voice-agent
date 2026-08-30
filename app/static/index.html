@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Agent vocal</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e;
+          --accent:#2f81f7; --live:#3fb950; --warn:#d29922; --err:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100dvh; background:var(--bg); color:var(--fg);
+         font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+         display:flex; flex-direction:column; }
+  header { padding:1rem 1.25rem; border-bottom:1px solid #21262d;
+           display:flex; align-items:center; gap:.75rem; }
+  #pill { font-size:.8rem; padding:.2rem .6rem; border-radius:999px;
+          background:#21262d; color:var(--dim); white-space:nowrap; }
+  #pill.on   { background:rgba(63,185,80,.15);  color:var(--live); }
+  #pill.busy { background:rgba(210,153,34,.15); color:var(--warn); }
+  #pill.err  { background:rgba(248,81,73,.15);  color:var(--err); }
+  #log { flex:1; overflow-y:auto; padding:1.25rem; display:flex;
+         flex-direction:column; gap:.9rem; }
+  .turn { max-width:min(46rem,90%); padding:.6rem .85rem; border-radius:.8rem; }
+  .me  { align-self:flex-end; background:#1f2937; }
+  .bot { align-self:flex-start; background:#161b22; border:1px solid #21262d; }
+  .partial { align-self:flex-end; color:var(--dim); font-style:italic; }
+  .meta { font-size:.72rem; color:var(--dim); margin-top:.3rem; }
+  .note { align-self:center; color:var(--dim); font-size:.82rem; text-align:center;
+          max-width:34rem; }
+  .note.bad { color:var(--err); }
+  footer { padding:1rem 1.25rem calc(1rem + env(safe-area-inset-bottom));
+           border-top:1px solid #21262d; display:flex; justify-content:center; }
+  button { font:inherit; font-weight:600; padding:.85rem 2rem; border-radius:999px;
+           border:0; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.stop { background:#30363d; }
+</style>
+</head>
+<body>
+<header><strong>Agent vocal</strong><span id="pill">à l'arrêt</span></header>
+<div id="log"></div>
+<footer><button id="go">Parler</button></footer>
+
+<script>
+const $log = document.getElementById('log');
+const $pill = document.getElementById('pill');
+const $go = document.getElementById('go');
+
+const IN_RATE = 16000;      // ce qu'attend le pipeline
+const FRAME = 512;          // 32 ms à 16 kHz — la taille de trame du pipeline
+
+let ws, inCtx, outCtx, micNode, stream, running = false;
+let outRate = 24000, nextAt = 0;
+const sources = new Set();
+let $partial = null;
+
+function say(kind, text, meta) {
+  const el = document.createElement('div');
+  el.className = kind;
+  el.textContent = text;
+  if (meta) {
+    const m = document.createElement('div');
+    m.className = 'meta'; m.textContent = meta; el.appendChild(m);
+  }
+  $log.appendChild(el);
+  $log.scrollTop = $log.scrollHeight;
+  return el;
+}
+function pill(text, cls = '') { $pill.textContent = text; $pill.className = cls; }
+
+// ── Lecture ────────────────────────────────────────────────────────────
+// On planifie chaque bloc à la suite du précédent plutôt que de le jouer
+// « maintenant » : sinon les blocs se chevauchent ou laissent des trous
+// audibles, le débit réseau n'étant pas régulier.
+function play(int16) {
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+  const buf = outCtx.createBuffer(1, f32.length, outRate);
+  buf.getChannelData(0).set(f32);
+  const src = outCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(outCtx.destination);
+  const now = outCtx.currentTime;
+  if (nextAt < now) nextAt = now + 0.06;   // coussin après un silence
+  src.start(nextAt);
+  nextAt += buf.duration;
+  sources.add(src);
+  src.onended = () => sources.delete(src);
+}
+
+// Barge-in : le serveur nous coupe. Il faut arrêter ce qui est DÉJÀ
+// planifié, pas seulement cesser d'en ajouter — sinon l'assistant continue
+// de parler plusieurs secondes après qu'on l'a interrompu.
+function flush() {
+  for (const s of sources) { try { s.stop(); } catch (e) {} }
+  sources.clear();
+  nextAt = 0;
+}
+
+// ── Capture ────────────────────────────────────────────────────────────
+const WORKLET = `
+class Cap extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Float32Array(${FRAME}); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.buf[this.n++] = ch[i];
+      if (this.n === ${FRAME}) { this.port.postMessage(this.buf.slice()); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor('cap', Cap);`;
+
+// Safari n'honore pas toujours sampleRate:16000 sur l'AudioContext. Il
+// faut donc rééchantillonner — mais SURTOUT PAS au plus proche voisin.
+//
+// Prendre un échantillon sur trois pour passer de 48 à 16 kHz replie tout
+// ce qui dépasse 8 kHz dans la bande utile : la voix devient métallique et
+// la reconnaissance déraille, jusqu'à se tromper de langue. Un WAV propre
+// généré par `say` ne révèle jamais ce défaut, puisqu'il arrive déjà en
+// 16 kHz — d'où un bug invisible en test et flagrant à l'usage.
+//
+// La moyenne sur la fenêtre source est un filtre passe-bas rudimentaire,
+// mais elle coûte trois multiplications et supprime l'essentiel du
+// repliement.
+function toInt16(f32, from) {
+  const ratio = from / IN_RATE;
+  const n = Math.floor(f32.length / ratio);
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(f32.length, Math.floor((i + 1) * ratio));
+    let sum = 0, count = 0;
+    for (let j = start; j < end; j++) { sum += f32[j]; count++; }
+    const v = count ? sum / count : (f32[start] || 0);
+    out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+  }
+  return out;
+}
+
+async function start() {
+  running = true;
+  $go.textContent = 'Arrêter'; $go.className = 'stop';
+  pill('connexion…');
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // L'annulation d'écho se fait ICI et pas côté serveur : lui ne
+        // peut pas savoir quand le son est réellement sorti du haut-parleur
+        // à l'autre bout du LAN. Le navigateur, si.
+        echoCancellation: true, noiseSuppression: true,
+        autoGainControl: true, channelCount: 1,
+      },
+    });
+  } catch (e) {
+    pill('micro refusé', 'err');
+    say('note bad', location.protocol === 'https:'
+      ? 'Micro refusé : autorise-le pour ce site dans les réglages du navigateur.'
+      : "Le micro exige HTTPS. Cette page est en " + location.protocol +
+        " — passe par ton nom de domaine interne, pas par l'adresse IP.");
+    return stop();
+  }
+
+  inCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: IN_RATE });
+  outCtx = new (window.AudioContext || window.webkitAudioContext)();
+  await inCtx.resume(); await outCtx.resume();   // iOS : exige le geste utilisateur
+  const rateNote = inCtx.sampleRate === IN_RATE
+    ? `micro à ${inCtx.sampleRate} Hz (natif)`
+    : `micro à ${inCtx.sampleRate} Hz, rééchantillonné vers ${IN_RATE}`;
+
+  // Le jeton voyage dans l'URL de la page : on le repasse à la WebSocket,
+  // qui est vérifiée séparément (une page servie ne vaut pas un accès).
+  // Peut être vide : le cookie posé à l'ouverture de la page prend alors
+  // le relais côté serveur.
+  const k = new URLSearchParams(location.search).get('k') || '';
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://')
+                     + location.host + '/ws?k=' + encodeURIComponent(k));
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    // Le serveur ne peut pas deviner ce que le navigateur lui a réellement
+    // donné : on le lui dit, pour que le journal porte la trace du taux
+    // d'origine quand une transcription part en vrille.
+    try { ws.send(JSON.stringify({ type: 'client', rate: inCtx.sampleRate })); } catch (e) {}
+    say('note', rateNote);
+  };
+
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) return play(new Int16Array(ev.data));
+    const m = JSON.parse(ev.data);
+    if (m.type === 'busy')  { pill('occupé', 'busy'); say('note bad', m.text); return stop(); }
+    if (m.type === 'ready') { outRate = m.sample_rate; pill('à l’écoute', 'on'); return; }
+    if (m.type === 'state') {
+      if (m.value === 'loading') pill('chargement des modèles…');
+      if (m.value === 'listening') { pill('à l’écoute', 'on'); flush(); }
+      if (m.value === 'speaking')  pill('il parle');
+      return;
+    }
+    if (m.type === 'partial') {
+      if (!$partial) $partial = say('turn partial', '');
+      $partial.textContent += m.text;
+      $log.scrollTop = $log.scrollHeight;
+      return;
+    }
+    if (m.type === 'exchange') {
+      if ($partial) { $partial.remove(); $partial = null; }
+      say('turn me', m.user);
+      say('turn bot', m.assistant, `LLM ${m.llm_ms} ms`);
+      return;
+    }
+    if (m.type === 'flush') return flush();
+    if (m.type === 'note')  return say('note', m.text);
+    if (m.type === 'error') return say('note bad', m.text);
+    if (m.type === 'fatal') { pill('en échec', 'err'); say('note bad', m.text); return stop(); }
+  };
+
+  ws.onclose = () => { if (running) { pill('déconnecté', 'err'); stop(); } };
+  ws.onerror = () => pill('erreur réseau', 'err');
+
+  await inCtx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
+  micNode = new AudioWorkletNode(inCtx, 'cap');
+  micNode.port.onmessage = (e) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(toInt16(e.data, inCtx.sampleRate).buffer);
+  };
+  inCtx.createMediaStreamSource(stream).connect(micNode);
+  // Le worklet n'émet pas de son : sans destination, certains navigateurs
+  // suspendent quand même le graphe. On le raccorde à un gain muet.
+  const mute = inCtx.createGain(); mute.gain.value = 0;
+  micNode.connect(mute).connect(inCtx.destination);
+}
+
+function stop() {
+  running = false;
+  $go.textContent = 'Parler'; $go.className = '';
+  flush();
+  try { ws && ws.close(); } catch (e) {}
+  try { stream && stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { inCtx && inCtx.close(); outCtx && outCtx.close(); } catch (e) {}
+  if ($pill.className === '') pill('à l’arrêt');
+}
+
+$go.onclick = () => running ? stop() : start();
+</script>
+</body>
+</html>
